@@ -115,23 +115,8 @@ export function buildRepoNamespace(repoFullName: string) {
 
   export async function deleteRepoNamespace(namespace: string) {
     const index = getPineconeIndex();
-
-    try {
-        await index.deleteNamespace(namespace);
-    } catch (error: any) {
-        if (
-            error?.statusCode === 404 ||
-            error?.name === "PineconeNotFoundError"
-        ) {
-            console.log(
-                `Pinecone namespace "${namespace}" does not exist. Skipping deletion.`
-            );
-            return;
-        }
-
-        throw error;
-    }
-}
+    await index.deleteNamespace(namespace);
+  }
 
   export async function saveRepoChunks(namespace: string, chunks: CodeChunk[]) {
     const index = getPineconeIndex();

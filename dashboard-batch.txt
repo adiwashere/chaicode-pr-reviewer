@@ -1,0 +1,313 @@
+import { requireAuth } from '@/features/auth/actions';
+import { DashboardHeader } from '@/features/dashboard/components/dashboard-header';
+import { GithubConnectCard } from '@/features/github/components/github-connect-card';
+import { getInstallationStatus } from '@/features/github/server/installation';
+import { Metadata } from 'next';
+import React from 'react'
+
+
+export const metadata: Metadata = {
+    title: "GitHub App · Dashboard",
+  };
+  
+
+const DashboardGithubPage = async() => {
+
+    const session = await requireAuth();
+    const installation = await getInstallationStatus(session.user.id)
+
+  return (
+    <>
+    <DashboardHeader
+    title="GitHub App"
+    description="Install or disconnect the reviewer app on your GitHub account."
+  />
+  <GithubConnectCard userId={session.user.id} installation={installation} />
+  </>
+  )
+}
+
+export default DashboardGithubPage
+
+
+import type { Metadata } from "next";
+import Link from "next/link";
+
+import { DashboardHeader } from "@/features/dashboard/components/dashboard-header";
+
+import { DASHBOARD_ROUTES } from "@/features/dashboard/lib/routes";
+import { getInstallationStatus } from "@/features/github/server/installation";
+
+import { Button } from "@/components/ui/button";
+import { requireAuth } from "@/features/auth/actions";
+import { RepoList } from "@/features/dashboard/components/repo-list";
+
+export const metadata: Metadata = {
+  title: "Repositories · Dashboard",
+};
+
+
+function ReposNotConnected() {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-4 p-6">
+      <p className="text-sm text-muted-foreground">
+        Install the GitHub App first to see your repositories.
+      </p>
+      <Button nativeButton={false} render={<Link href={DASHBOARD_ROUTES.github} />}>
+        Go to GitHub App
+      </Button>
+    </div>
+  );
+}
+
+/**
+ * Repositories list page with GitHub connection guard.
+ *
+ * @returns Header plus either connect prompt or interactive repo table.
+ */
+export default async function DashboardReposPage() {
+  const session = await requireAuth();
+  const installation = await getInstallationStatus(session.user.id);
+
+  const header = (
+    <DashboardHeader
+      title="Repositories"
+      description="All public and private repositories available to the GitHub App."
+    />
+  );
+
+  if (!installation.connected) {
+    return (
+      <>
+        {header}
+        <ReposNotConnected />
+      </>
+    );
+  }
+
+  return (
+    <>
+      {header}
+      <RepoList />
+    </>
+  );
+}
+import { requireAuth } from "@/features/auth/actions";
+import { DashboardHeader } from "@/features/dashboard/components/dashboard-header";
+import { SettingsContent } from "@/features/dashboard/components/settings-content";
+import { getUserSettings } from "@/features/settings/server/get-settings";
+
+export default async function DashboardSettingsPage() {
+    const session = await requireAuth();
+    const settings = await getUserSettings(session.user.id);
+  
+    return (
+      <>
+        <DashboardHeader
+          title="Settings"
+          description="Manage your profile and subscription."
+        />
+        <SettingsContent
+          profile={settings.profile}
+          subscription={settings.subscription}
+          usage={settings.usage}
+        />
+      </>
+    );
+  }
+  
+export const DASHBOARD_ROUTES = {
+  overview: "/dashboard",
+  repos: "/dashboard/repos",
+  pullRequest:"/dashboard/pull-request",
+  github: "/dashboard/github",
+  settings: "/dashboard/settings",
+} as const;
+
+export type DashboardRoute =
+  (typeof DASHBOARD_ROUTES)[keyof typeof DASHBOARD_ROUTES];
+
+export const DASHBOARD_NAV_ITEMS = [
+  {
+    title: "Overview",
+    href: DASHBOARD_ROUTES.overview,
+    icon: "layout-dashboard" as const,
+  },
+  {
+    title: "Repositories",
+    href: DASHBOARD_ROUTES.repos,
+    icon: "folder-git-2" as const,
+  },
+   {
+    title: "PullRequests",
+    href: DASHBOARD_ROUTES.pullRequest,
+    icon: "folder-git-2" as const,
+  },
+  {
+    title: "GitHub App",
+    href: DASHBOARD_ROUTES.github,
+    icon: "github" as const,
+  },
+  {
+    title: "Settings",
+    href: DASHBOARD_ROUTES.settings,
+    icon: "settings" as const,
+  },
+] as const;
+import { cn } from "@/lib/utils";
+
+/** Background, border, and text colors for inline status badges. */
+export const statusBadgeClass = {
+  success:
+    "border-green-500/40 bg-green-500/15 text-green-700 dark:text-green-400",
+  warning:
+    "border-amber-500/40 bg-amber-500/15 text-amber-700 dark:text-amber-400",
+  danger: "border-red-500/40 bg-red-500/15 text-red-700 dark:text-red-400",
+  info: "border-blue-500/40 bg-blue-500/15 text-blue-700 dark:text-blue-400",
+  neutral: "border-border bg-muted text-muted-foreground",
+} as const;
+
+/** Button variants for primary actions like "Install" or "Disconnect". */
+export const statusButtonClass = {
+  success:
+    "bg-green-600 text-white hover:bg-green-700 focus-visible:ring-green-500/50 dark:bg-green-600 dark:hover:bg-green-500",
+  danger:
+    "border-red-500/50 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-400 dark:hover:bg-red-500/20",
+  warning:
+    "border-amber-500/50 bg-amber-500/10 text-amber-800 hover:bg-amber-500/20 dark:text-amber-400",
+} as const;
+
+/**
+ * Builds a complete className string for a small status badge pill.
+ *
+ * @param tone - Semantic color from `statusBadgeClass` keys.
+ * @param className - Optional extra classes (e.g. `gap-1` when an icon is inside).
+ * @returns A merged Tailwind class string ready for a `<span>`.
+ */
+export function statusBadge(
+  tone: keyof typeof statusBadgeClass,
+  className?: string
+) {
+  return cn(
+    "inline-flex items-center rounded-none border px-2 py-0.5 text-xs font-medium capitalize",
+    statusBadgeClass[tone],
+    className
+  );
+}
+
+export type RepoSyncStatus = "pending" | "syncing" | "synced" | "failed";
+
+/** Whether a repository is visible to everyone or only to collaborators. */
+export type RepoVisibility = "public" | "private";
+
+/**
+ * A repository row displayed in the Repositories table.
+ * Fields mirror what the GitHub API returns, plus optional sync status.
+ */
+export type DashboardRepo = {
+  id: string;
+  name: string;
+  fullName: string;
+  visibility: RepoVisibility;
+  defaultBranch: string;
+  updatedAt: string;
+  language: string | null;
+  stars: number;
+  syncStatus?: RepoSyncStatus | null;
+};
+
+/**
+ * Whether the user has installed the GitHub App and on which account.
+ * `accountLogin` is the GitHub username or org name the app was installed for.
+ */
+export type GithubInstallationStatus = {
+  connected: boolean;
+  accountLogin: string | null;
+  installedAt: string | null;
+};
+
+/** The two billing tiers available in the app. */
+export type SubscriptionPlan = "free" | "pro";
+
+/**
+ * The user's current subscription state, used on the Settings page
+ * and in the sidebar user menu badge.
+ */
+export type UserSubscription = {
+  plan: SubscriptionPlan;
+  status: "active" | "canceled" | "trialing";
+  renewsAt: string | null;
+};
+import type { SubscriptionPlan } from "@/features/dashboard/lib/types";
+
+export const PLAN_DETAILS: Record<
+  SubscriptionPlan,
+  { label: string; features: string[] }
+> = {
+  free: {
+    label: "Free",
+    features: [
+      "Up to 5 AI reviews per month",
+      "Public and private repositories only",
+      "Community support",
+    ],
+  },
+  pro: {
+    label: "Pro",
+    features: [
+      "Unlimited AI reviews on connected repos",
+      "Public and private repository support",
+      "Priority support",
+    ],
+  },
+};
+import { getUserSubscription } from "@/features/billing/server/subscription";
+import { getUsageSummary } from "@/features/billing/server/usage";
+import { prisma } from "@/lib/db";
+import { UserSettings } from "../types";
+
+export async function getUserSettings(userId: string): Promise<UserSettings> {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        name: true,
+        email: true,
+        image: true,
+        createdAt: true,
+      },
+    });
+  
+    if (!user) {
+      throw new Error("User not found");
+    }
+  
+    const subscription = await getUserSubscription(userId);
+    const usage = await getUsageSummary(userId);
+  
+    return {
+      profile: {
+        name: user.name,
+        email: user.email,
+        image: user.image,
+        memberSince: user.createdAt.toISOString(),
+      },
+      subscription,
+      usage,
+    };
+  }
+import { UsageSummary } from "@/features/billing/server/usage";
+import { UserSubscription } from "@/features/dashboard/lib/types";
+
+export type SettingsProfile = {
+    name: string;
+    email: string;
+    image: string | null;
+    memberSince: string;
+  };
+  
+  export type UserSettings = {
+    profile: SettingsProfile;
+    subscription: UserSubscription;
+    usage: UsageSummary;
+  };
+  

@@ -1,0 +1,291 @@
+import Razorpay from "razorpay";
+
+
+let razorpay: Razorpay | null = null;
+
+
+export function getRazorpay(){
+    if(!razorpay){
+        razorpay = new Razorpay({
+            key_id: process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID!,
+            key_secret: process.env.RAZORPAY_KEY_SECRET!,
+        })
+    }
+
+    return razorpay;
+}
+
+
+import type { UserSubscription } from "@/features/dashboard/lib/types";
+import { getRazorpay } from "@/features/billing/lib/razorpay";
+import { prisma } from "@/lib/db";
+
+export async function getUserSubscription(
+  userId: string
+): Promise<UserSubscription> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      plan: true,
+      subscriptionStatus: true,
+      subscriptionRenewsAt: true,
+    },
+  });
+
+  if (!user) {
+    return { plan: "free", status: "active", renewsAt: null };
+  }
+
+  const renewsAt = user.subscriptionRenewsAt?.toISOString() ?? null;
+
+  if (user.plan !== "pro") {
+    return { plan: "free", status: "active", renewsAt };
+  }
+
+  if (user.subscriptionStatus === "pending") {
+    return { plan: "free", status: "trialing", renewsAt };
+  }
+
+  if (user.subscriptionStatus === "canceled") {
+    const stillActive =
+      user.subscriptionRenewsAt !== null && user.subscriptionRenewsAt > new Date();
+
+    if (stillActive) {
+      return { plan: "pro", status: "active", renewsAt };
+    }
+
+    return { plan: "free", status: "canceled", renewsAt };
+  }
+
+  if (user.subscriptionStatus === "active") {
+    return { plan: "pro", status: "active", renewsAt };
+  }
+
+  return { plan: "free", status: "canceled", renewsAt };
+}
+
+export async function createProSubscription(userId: string) {
+  const subscription = await getUserSubscription(userId);
+
+  if (subscription.plan === "pro" && subscription.status === "active") {
+    throw new Error("You already have an active Pro subscription.");
+  }
+
+  const planId = process.env.RAZORPAY_PLAN_ID;
+  if (!planId) {
+    throw new Error("Razorpay plan is not configured.");
+  }
+
+  const razorpay = getRazorpay();
+  const razorpaySubscription = await razorpay.subscriptions.create({
+    plan_id: planId,
+    total_count: 12,
+    customer_notify: 1,
+    notes: { userId },
+  });
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      razorpaySubscriptionId: razorpaySubscription.id,
+      subscriptionStatus: "pending",
+    },
+  });
+
+  return { subscriptionId: razorpaySubscription.id };
+}
+
+export async function cancelProSubscription(userId: string) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { razorpaySubscriptionId: true },
+  });
+
+  if (!user?.razorpaySubscriptionId) {
+    throw new Error("No active subscription found.");
+  }
+
+  const razorpay = getRazorpay();
+  await razorpay.subscriptions.cancel(user.razorpaySubscriptionId, 1);
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: { subscriptionStatus: "canceled" },
+  });
+}
+import { startOfMonth } from "date-fns";
+
+import { getUserInstallationId } from "@/features/github/server/installation";
+import { getUserSubscription } from "@/features/billing/server/subscription";
+import { prisma } from "@/lib/db";
+
+export const FREE_MONTHLY_LIMIT = 5;
+
+export type UsageSummary = {
+  used: number;
+  limit: number | null;
+};
+
+export async function getReviewsThisMonth(userId: string): Promise<number> {
+  const installationId = await getUserInstallationId(userId);
+
+  if (!installationId) {
+    return 0;
+  }
+
+  return prisma.pullRequest.count({
+    where: {
+      installationId,
+      status: "reviewed",
+      reviewedAt: { gte: startOfMonth(new Date()) },
+    },
+  });
+}
+
+export async function canUserReview(userId: string): Promise<boolean> {
+  const subscription = await getUserSubscription(userId);
+
+  if (subscription.plan === "pro" && subscription.status === "active") {
+    return true;
+  }
+
+  const used = await getReviewsThisMonth(userId);
+  return used < FREE_MONTHLY_LIMIT;
+}
+
+export async function getUsageSummary(userId: string): Promise<UsageSummary> {
+  const subscription = await getUserSubscription(userId);
+  const used = await getReviewsThisMonth(userId);
+
+  if (subscription.plan === "pro" && subscription.status === "active") {
+    return { used, limit: null };
+  }
+
+  return { used, limit: FREE_MONTHLY_LIMIT };
+}
+import { createHmac, timingSafeEqual } from "crypto";
+
+import { prisma } from "@/lib/db";
+
+type RazorpaySubscriptionPayload = {
+  id: string;
+  current_end?: number;
+  notes?: { userId?: string };
+};
+
+type RazorpayWebhookBody = {
+  event: string;
+  payload: {
+    subscription?: {
+      entity: RazorpaySubscriptionPayload;
+    };
+  };
+};
+
+const HANDLED_EVENTS = new Set([
+  "subscription.activated",
+  "subscription.charged",
+  "subscription.cancelled",
+  "subscription.halted",
+  "subscription.completed",
+]);
+
+export async function POST(request: Request) {
+  const body = await request.text();
+  const signature = request.headers.get("x-razorpay-signature");
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+
+  if (!secret || !signature) {
+    return Response.json({ error: "Invalid signature" }, { status: 401 });
+  }
+
+  const expected = createHmac("sha256", secret).update(body).digest("hex");
+
+  if (
+    expected.length !== signature.length ||
+    !timingSafeEqual(Buffer.from(expected), Buffer.from(signature))
+  ) {
+    return Response.json({ error: "Invalid signature" }, { status: 401 });
+  }
+
+  let event: RazorpayWebhookBody;
+  try {
+    event = JSON.parse(body) as RazorpayWebhookBody;
+  } catch {
+    return Response.json({ error: "Invalid payload" }, { status: 400 });
+  }
+
+  if (!HANDLED_EVENTS.has(event.event)) {
+    return Response.json({ received: true });
+  }
+
+  const subscription = event.payload.subscription?.entity;
+  if (!subscription) {
+    return Response.json({ error: "Missing subscription" }, { status: 400 });
+  }
+
+  const existingUser = await prisma.user.findFirst({
+    where: { razorpaySubscriptionId: subscription.id },
+    select: { id: true },
+  });
+
+  const userId = existingUser?.id ?? subscription.notes?.userId ?? null;
+  if (!userId) {
+    console.error(
+      "Razorpay webhook: no user for subscription",
+      subscription.id,
+      event.event
+    );
+    return Response.json({ received: true });
+  }
+
+  const renewsAt = subscription.current_end
+    ? new Date(subscription.current_end * 1000)
+    : null;
+
+  if (event.event === "subscription.activated") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        plan: "pro",
+        razorpaySubscriptionId: subscription.id,
+        subscriptionStatus: "active",
+        subscriptionRenewsAt: renewsAt,
+      },
+    });
+  }
+
+  if (event.event === "subscription.charged") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { subscriptionRenewsAt: renewsAt },
+    });
+  }
+
+  if (event.event === "subscription.cancelled") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { subscriptionStatus: "canceled" },
+    });
+  }
+
+  if (event.event === "subscription.halted") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { subscriptionStatus: "halted" },
+    });
+  }
+
+  if (event.event === "subscription.completed") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        plan: "free",
+        subscriptionStatus: "canceled",
+        subscriptionRenewsAt: null,
+      },
+    });
+  }
+
+  return Response.json({ received: true });
+}

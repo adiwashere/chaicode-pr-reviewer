@@ -1,0 +1,486 @@
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\reviews\server\generate-review.ts ====================
+import { generateText } from "ai";
+import { openrouter } from "@/features/ai"
+
+const REVIEW_MODEL = "openrouter/free"
+
+const SYSTEM_PROMPT = `You are an expert code reviewer with deep knowledge of software engineering best practices, security, and performance optimization.
+
+Review the provided unified diff chunks and write a concise, actionable pull request review in markdown.
+
+## Review Checklist
+
+Analyze the changes across these dimensions (only mention what's relevant):
+
+- **Correctness** — Bugs, logic errors, off-by-one errors, incorrect assumptions
+- **Security** — Injection risks, auth issues, exposed secrets, unsafe deserialization, unvalidated input
+- **Performance** — Unnecessary loops, missing indexes, N+1 queries, memory leaks
+- **Reliability** — Unhandled errors/edge cases, missing null checks, race conditions
+- **Readability** — Naming clarity, overly complex logic, missing comments on non-obvious code
+- **Maintainability** — Tight coupling, duplication, violations of SOLID/DRY principles
+
+
+## Output Format
+
+Start with a **one-line summary** of the overall change quality.
+
+Then use this structure if there are findings:
+
+### ✅ What looks good
+(skip if nothing notable)
+
+### ⚠️ Suggestions
+(non-blocking improvements)
+
+### 🚨 Issues
+(bugs, security problems, or breaking changes that should be fixed)
+
+## Guidelines
+
+- Be specific: reference the relevant code, function names, or line context
+- Be constructive: explain *why* something is a problem and suggest a fix
+- Be proportional: don't nitpick minor style issues if there are real bugs
+- If the diff looks clean with no concerns, say so clearly in 1–2 sentences — do not invent problems
+- Tailor feedback to the repository language and conventions visible in the diff`;
+
+
+type ReviewInput = {
+    repoFullName: string;
+    title: string;
+    /** Chunks retrieved from the PR's Pinecone namespace */
+    contextSnippets: string[];
+    /** Optional chunks from repo-sync namespace (full codebase context) */
+    repoContextSnippets: string[];
+};
+
+
+function buildRepoContextSection(repoContextSnippets: string[]) {
+    if (repoContextSnippets.length === 0) {
+        return "";
+    }
+
+    const repoContext = repoContextSnippets.join("\n\n---\n\n");
+
+    return `
+  
+  Related code from the repository (for context only, not part of the change):
+  
+  ${repoContext}`;
+}
+
+export async function generateReview(input: ReviewInput) {
+    const context = input.contextSnippets.join("\n\n---\n\n");
+    const repoContextSection = buildRepoContextSection(input.repoContextSnippets);
+
+    const { text } = await generateText({
+        model: openrouter(REVIEW_MODEL),
+        system: SYSTEM_PROMPT,
+        prompt: `Repository: ${input.repoFullName}
+  Pull request title: ${input.title}
+  
+  Code changes:
+  
+  ${context}${repoContextSection}`,
+    });
+
+    return text;
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\reviews\server\post-pr-comment.ts ====================
+import { getGithubApp } from "@/features/github/utils/github-app";
+
+export async function postPrComment(
+    installationId: number,
+    repoFullName: string,
+    prNumber: number,
+    body: string
+) {
+    const app = getGithubApp();
+    const octokit = await app.getInstallationOctokit(installationId);
+    const [owner, repo] = repoFullName.split("/");
+
+    await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
+        owner,
+        repo,
+        issue_number: prNumber,
+        body,
+    });
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\reviews\server\pr-files.ts ====================
+import { getGithubApp } from "@/features/github/utils/github-app";
+import { PrFile } from "../types/review";
+
+const FILES_PER_PAGE = 100;
+
+/** Formats PR file patches into a markdown diff section for the review prompt. */
+export function formatPrFilesForReview(files: PrFile[]): string {
+    return files
+        .map(
+            (file) =>
+                `### ${file.filePath}\n\`\`\`diff\n${file.patch}\n\`\`\``
+        )
+        .join("\n\n");
+}
+
+export async function getPullRequestFiles(
+    installationId: number,
+    repoFullName: string,
+    prNumber: number
+): Promise<PrFile[]> {
+    const app = getGithubApp();
+    const octokit = await app.getInstallationOctokit(installationId)
+    const [owner, repo] = repoFullName.split("/");
+
+    const { data } = await octokit.request(
+        "GET /repos/{owner}/{repo}/pulls/{pull_number}/files",
+        { owner, repo, pull_number: prNumber, per_page: FILES_PER_PAGE }
+    )
+
+    const files: PrFile[] = [];
+
+    for (const file of data) {
+        if (!file.patch) {
+            continue;
+        }
+
+        files.push({ filePath: file.filename, patch: file.patch });
+    }
+
+    return files;
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\reviews\server\review-pr-function.ts ====================
+import { inngest } from "@/features/inngest/client";
+import { prisma } from "@/lib/db";
+import { formatPrFilesForReview, getPullRequestFiles } from "./pr-files";
+import { generateReview } from "./generate-review";
+import { postPrComment } from "./post-pr-comment";
+import { chunkPrFiles } from "../utils/chunk-code";
+import { buildPrNamespace, saveChunksToPinecone, searchPrContext } from "./vector";
+import { buildRepoNamespace } from "@/features/repo-sync/server/repo-sync";
+
+
+export const reviewPullRequest = inngest.createFunction(
+    { id: "review-pull-request", triggers: { event: "github/pr.received" } },
+    async ({ event, step }) => {
+      const pullRequestId = event.data.pullRequestId;
+  
+      const pullRequest = await step.run("mark-processing", async () => {
+        return prisma.pullRequest.update({
+          where: { id: pullRequestId },
+          data: { status: "processing" },
+        });
+      });
+  
+      const chunks = await step.run("breakdown-code", async () => {
+        const files = await getPullRequestFiles(
+          pullRequest.installationId,
+          pullRequest.repoFullName,
+          pullRequest.prNumber
+        );
+  
+        // Turn unified diffs into fixed-size chunks for embedding
+        return chunkPrFiles(pullRequest.prNumber, files);
+      });
+  
+      if (chunks.length === 0) {
+        await step.run("mark-reviewed-no-code", async () => {
+          await prisma.pullRequest.update({
+            where: { id: pullRequestId },
+            data: { status: "reviewed" },
+          });
+        });
+  
+        return { pullRequestId, status: "reviewed", reason: "no code to review" };
+      }
+  
+      // PR namespace isolates this diff from other PRs and from repo-wide sync data
+      const namespace = buildPrNamespace(
+        pullRequest.repoFullName,
+        pullRequest.prNumber
+      );
+  
+      await step.run("save-vectors-to-pinecone", async () => {
+        await saveChunksToPinecone(namespace, chunks);
+      });
+  
+      // Pinecone needs a short delay before new vectors appear in search results
+      await step.sleep("wait-for-vectors-to-index", "10s");
+  
+      // Extra context from the on-demand codebase sync, when the repo was synced
+      const repoContextSnippets = await step.run("search-repo-context", async () => {
+        const repoSync = await prisma.repoSync.findUnique({
+          where: { repoFullName: pullRequest.repoFullName },
+        });
+  
+        if (!repoSync || repoSync.status !== "synced") {
+          return [];
+        }
+  
+        const repoNamespace = buildRepoNamespace(pullRequest.repoFullName);
+        return searchPrContext(repoNamespace, pullRequest.title);
+      });
+  
+      const review = await step.run("generate-ai-review", async () => {
+        // Search within this PR's namespace for chunks related to the PR title
+        const contextSnippets = await searchPrContext(
+          namespace,
+          pullRequest.title
+        );
+  
+        return generateReview({
+          repoFullName: pullRequest.repoFullName,
+          title: pullRequest.title,
+          contextSnippets,
+          repoContextSnippets,
+        });
+      });
+  
+      await step.run("post-pr-comment", async () => {
+        await postPrComment(
+          pullRequest.installationId,
+          pullRequest.repoFullName,
+          pullRequest.prNumber,
+          review
+        );
+      });
+  
+      await step.run("mark-reviewed", async () => {
+        await prisma.pullRequest.update({
+          where: { id: pullRequestId },
+          data: {
+            status: "reviewed",
+            reviewComment: review,
+            reviewedAt: new Date(),
+          },
+        });
+      });
+  
+      return { pullRequestId, status: "reviewed" };
+    }
+  );
+  
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\reviews\server\save-pull-request.ts ====================
+import { PullRequestWebhookPayload } from "@/features/github/server/webhook-handler";
+import { prisma } from "@/lib/db";
+
+
+function getAuthorLogin(
+    user: { login: string } | null
+  ): string | null {
+    if (!user) {
+      return null;
+    }
+    return user.login;
+  }
+  
+
+export async function savePullRequest(payload:PullRequestWebhookPayload){
+    const repoFullName = payload.repository.full_name;
+    const prNumber = payload.pull_request.number;
+
+    return prisma.pullRequest.upsert({
+        where:{
+            repoFullName_prNumber:{repoFullName , prNumber}
+        },
+        create:{
+            installationId: payload.installation.id,
+            repoFullName,
+            prNumber,
+            title: payload.pull_request.title,
+            authorLogin: getAuthorLogin(payload.pull_request.user),
+            headSha: payload.pull_request.head.sha,
+            baseBranch: payload.pull_request.base.ref,
+            status: "pending",
+        },
+        update:{
+            title: payload.pull_request.title,
+            headSha: payload.pull_request.head.sha,
+           
+            status: "pending",
+        }
+    });
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\reviews\server\vector.ts ====================
+import type { CodeChunk } from "@/features/reviews/types/review";
+import { getPineconeIndex } from "@/features/pinecone/client";
+
+const CONTEXT_RESULTS = 10;
+
+export function buildPrNamespace(repoFullName: string, prNumber: number) {
+    return `${repoFullName.replace("/", "--")}--pr-${prNumber}`;
+}
+
+export async function saveChunksToPinecone(
+    namespace: string,
+    chunks: CodeChunk[]
+) {
+    const index = getPineconeIndex();
+
+    const records = chunks.map((chunk) => ({
+        id: chunk.id,
+        text: chunk.text,
+        filePath: chunk.filePath,
+    }));
+
+    // namespace() scopes vectors so this PR never mixes with repo-wide sync data
+    await index.namespace(namespace).upsertRecords({ records });
+}
+
+
+export async function searchPrContext(namespace: string, query: string) {
+    const index = getPineconeIndex();
+
+    const response = await index.namespace(namespace).searchRecords({
+        query: { topK: CONTEXT_RESULTS, inputs: { text: query } },
+    });
+
+    const snippets: string[] = [];
+
+    for (const hit of response.result.hits) {
+        const fields = hit.fields as { text?: string; filePath?: string };
+        if (!fields.text) {
+            continue;
+        }
+
+        snippets.push(`File: ${fields.filePath}\n${fields.text}`);
+    }
+
+    return snippets;
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\reviews\types\review.ts ====================
+
+export type PrFile = {
+
+    filePath: string;
+
+    patch: string;
+};
+
+
+export type CodeChunk = {
+    /** Unique id used as the Pinecone record id, e.g. `pr-42--src/foo.ts--part-0` */
+    id: string;
+    /** Source file path this chunk came from */
+    filePath: string;
+    /** Raw text stored in Pinecone and searched at review time */
+    text: string;
+};
+
+/**
+ * Subset of the GitHub `pull_request` webhook payload we persist and review.
+ *
+ * @see features/github/server/webhook-handler.ts — parses and validates webhooks
+ */
+export type PullRequestWebhookPayload = {
+    /** Webhook action, e.g. `opened`, `synchronize`, `reopened` */
+    action: string;
+    /** GitHub App installation that received the event */
+    installation: { id: number };
+    repository: { full_name: string };
+    pull_request: {
+        number: number;
+        title: string;
+        user: { login: string } | null;
+        head: { sha: string };
+        base: { ref: string };
+    };
+};
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\reviews\utils\chunk-code.ts ====================
+import type { CodeChunk, PrFile } from "@/features/reviews/types/review";
+
+const MAX_CHUNK_LINES = 80;
+
+function buildChunkId(prNumber: number, filePath: string, part: number) {
+    return `pr-${prNumber}--${filePath}--part-${part}`;
+  }
+
+
+  export function chunkPrFiles(prNumber: number, files: PrFile[]): CodeChunk[] {
+    const chunks: CodeChunk[] = [];
+  
+    for (const file of files) {
+      const lines = file.patch.split("\n");
+  
+      // Slide a fixed-size window across the diff; large files produce many chunks
+      for (let start = 0; start < lines.length; start += MAX_CHUNK_LINES) {
+        const part = start / MAX_CHUNK_LINES;
+        const text = lines.slice(start, start + MAX_CHUNK_LINES).join("\n");
+  
+        chunks.push({
+          id: buildChunkId(prNumber, file.filePath, part),
+          filePath: file.filePath,
+          text,
+        });
+      }
+    }
+  
+    return chunks;
+  }
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\inngest\client.ts ====================
+
+import { Inngest } from "inngest";
+
+export const inngest = new Inngest({ id: "chaicode-pr-reviewer" });
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\pinecone\client.ts ====================
+import { Pinecone } from '@pinecone-database/pinecone';
+
+let pinecone: Pinecone | null = null;
+
+export function getPineconeIndex() {
+    if (!pinecone) {
+        pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY! });
+    }
+
+    return pinecone.index({ name: process.env.PINECONE_INDEX! });
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\inngest\function.ts ====================
+import { inngest } from "@/features/inngest/client";
+
+
+export const processTask = inngest.createFunction(
+  { id: "process-task", triggers: { event: "app/task.created" } },
+  async ({ event, step }) => {
+    const result = await step.run("handle-task", async () => {
+      return { processed: true, id: event.data.id };
+    });
+
+    await step.sleep("pause", "1s");
+
+    return { message: `Task ${event.data.id} complete`, result };
+  }
+);
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\inngest\route.ts ====================
+import { inngest } from "@/features/inngest/client";
+import { reviewPullRequest } from "@/features/reviews/server/review-pr-function";
+import { serve } from "inngest/next";
+import { processTask } from "./function";
+import { syncRepoCodebaseFunction } from "@/features/repo-sync/server/repo-sync-function";
+
+
+export const { GET, POST, PUT } = serve({
+  client: inngest,
+  functions: [processTask, reviewPullRequest , syncRepoCodebaseFunction],
+});
+
+

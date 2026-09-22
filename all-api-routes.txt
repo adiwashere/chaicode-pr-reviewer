@@ -1,0 +1,295 @@
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\auth\[...all]\route.ts ====================
+
+import { auth } from "@/lib/auth"; // path to your auth file
+import { toNextJsHandler } from "better-auth/next-js";
+export const { POST, GET } = toNextJsHandler(auth);
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\github\callback\route.ts ====================
+
+import { DASHBOARD_ROUTES } from "@/features/dashboard/lib/routes";
+import { saveInstallation } from "@/features/github/server/installation";
+import { getServerSession } from "@/features/auth/actions";
+import { redirect } from "next/navigation";
+
+
+function buildSignInCallbackUrl(installationId: string | null): string {
+    if (installationId) {
+      return `/api/github/callback?installation_id=${installationId}`;
+    }
+  
+    return DASHBOARD_ROUTES.github;
+  }
+
+export async function GET(request: Request) {
+
+    const {searchParams} = new URL(request.url);
+
+    const  installationId = searchParams.get("installation_id");
+    const session = await getServerSession();
+
+
+    if(!session){
+        const callbackUrl = buildSignInCallbackUrl(installationId);
+        redirect(`/sign-in?callbackUrl=${encodeURIComponent(callbackUrl)}`); 
+    }
+
+    if(installationId){
+        await saveInstallation(session.user.id , Number(installationId))
+    }
+
+    redirect(DASHBOARD_ROUTES.github)
+}
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\github\repos\route.ts ====================
+
+import { getServerSession } from "@/features/auth/actions";
+import { getUserInstallationId } from "@/features/github/server/installation";
+import { getInstallationReposPage } from "@/features/github/server/repos";
+import { getRepoSyncStatuses } from "@/features/repo-sync/server/repo-sync";
+import { dataTagErrorSymbol } from "@tanstack/react-query";
+import { NextResponse } from "next/server";
+
+export async function GET(request: Request) {
+    const session = await getServerSession();
+
+    if (!session) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const installationId = await getUserInstallationId(session.user.id);
+
+    if (!installationId) {
+        return NextResponse.json({ error: "GitHub App not connected" }, { status: 400 });
+    }
+
+    const { searchParams } = new URL(request.url);
+
+    const page = Math.max(1, Number(searchParams.get("page") ?? "1"));
+
+    const data = await getInstallationReposPage(installationId, page);
+
+    const repoFullNames = data.repos.map((repo) => repo.fullName);
+
+    const syncStatuses = await getRepoSyncStatuses(repoFullNames);
+
+    const repos = data.repos.map((repo) => ({
+        ...repo,
+        syncStatus: syncStatuses[repo.fullName] ?? null
+    }));
+
+
+    return NextResponse.json({ ...data, repos })
+}
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\github\webhook\route.ts ====================
+
+import { handleGithubWebhook } from "@/features/github/server/webhook-handler";
+
+export const POST = handleGithubWebhook
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\inngest\function.ts ====================
+
+import { inngest } from "@/features/inngest/client";
+
+
+export const processTask = inngest.createFunction(
+  { id: "process-task", triggers: { event: "app/task.created" } },
+  async ({ event, step }) => {
+    const result = await step.run("handle-task", async () => {
+      return { processed: true, id: event.data.id };
+    });
+
+    await step.sleep("pause", "1s");
+
+    return { message: `Task ${event.data.id} complete`, result };
+  }
+);
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\inngest\route.ts ====================
+
+import { inngest } from "@/features/inngest/client";
+import { reviewPullRequest } from "@/features/reviews/server/review-pr-function";
+import { serve } from "inngest/next";
+import { processTask } from "./function";
+import { syncRepoCodebaseFunction } from "@/features/repo-sync/server/repo-sync-function";
+
+
+export const { GET, POST, PUT } = serve({
+  client: inngest,
+  functions: [processTask, reviewPullRequest , syncRepoCodebaseFunction],
+});
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\razorpay\webhook\route.ts ====================
+
+import { createHmac, timingSafeEqual } from "crypto";
+
+import { prisma } from "@/lib/db";
+
+type RazorpaySubscriptionPayload = {
+  id: string;
+  current_end?: number;
+  notes?: { userId?: string };
+};
+
+type RazorpayWebhookBody = {
+  event: string;
+  payload: {
+    subscription?: {
+      entity: RazorpaySubscriptionPayload;
+    };
+  };
+};
+
+const HANDLED_EVENTS = new Set([
+  "subscription.activated",
+  "subscription.charged",
+  "subscription.cancelled",
+  "subscription.halted",
+  "subscription.completed",
+]);
+
+export async function POST(request: Request) {
+  const body = await request.text();
+  const signature = request.headers.get("x-razorpay-signature");
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+
+  if (!secret || !signature) {
+    return Response.json({ error: "Invalid signature" }, { status: 401 });
+  }
+
+  const expected = createHmac("sha256", secret).update(body).digest("hex");
+
+  if (
+    expected.length !== signature.length ||
+    !timingSafeEqual(Buffer.from(expected), Buffer.from(signature))
+  ) {
+    return Response.json({ error: "Invalid signature" }, { status: 401 });
+  }
+
+  let event: RazorpayWebhookBody;
+  try {
+    event = JSON.parse(body) as RazorpayWebhookBody;
+  } catch {
+    return Response.json({ error: "Invalid payload" }, { status: 400 });
+  }
+
+  if (!HANDLED_EVENTS.has(event.event)) {
+    return Response.json({ received: true });
+  }
+
+  const subscription = event.payload.subscription?.entity;
+  if (!subscription) {
+    return Response.json({ error: "Missing subscription" }, { status: 400 });
+  }
+
+  const existingUser = await prisma.user.findFirst({
+    where: { razorpaySubscriptionId: subscription.id },
+    select: { id: true },
+  });
+
+  const userId = existingUser?.id ?? subscription.notes?.userId ?? null;
+  if (!userId) {
+    console.error(
+      "Razorpay webhook: no user for subscription",
+      subscription.id,
+      event.event
+    );
+    return Response.json({ received: true });
+  }
+
+  const renewsAt = subscription.current_end
+    ? new Date(subscription.current_end * 1000)
+    : null;
+
+  if (event.event === "subscription.activated") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        plan: "pro",
+        razorpaySubscriptionId: subscription.id,
+        subscriptionStatus: "active",
+        subscriptionRenewsAt: renewsAt,
+      },
+    });
+  }
+
+  if (event.event === "subscription.charged") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { subscriptionRenewsAt: renewsAt },
+    });
+  }
+
+  if (event.event === "subscription.cancelled") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { subscriptionStatus: "canceled" },
+    });
+  }
+
+  if (event.event === "subscription.halted") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { subscriptionStatus: "halted" },
+    });
+  }
+
+  if (event.event === "subscription.completed") {
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        plan: "free",
+        subscriptionStatus: "canceled",
+        subscriptionRenewsAt: null,
+      },
+    });
+  }
+
+  return Response.json({ received: true });
+}
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\repo-sync\route.ts ====================
+
+import { getServerSession } from "@/features/auth/actions";
+import { getUserInstallationId } from "@/features/github/server/installation";
+import { triggerRepoSync } from "@/features/repo-sync/server/repo-sync";
+import { NextResponse } from "next/server";
+
+type SyncRequest = {
+  repoFullName?: unknown;
+  branch?: unknown;
+};
+
+export async function POST(request: Request) {
+  const session = await getServerSession();
+
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  let body: SyncRequest;
+
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
+  const repoFullName = typeof body.repoFullName === "string" ? body.repoFullName.trim() : "";
+  const branch = typeof body.branch === "string" ? body.branch.trim() : "";
+
+  if (!/^[-.\w]+\/[-.\w]+$/.test(repoFullName) || !branch) {
+    return NextResponse.json({ error: "Repository and branch are required" }, { status: 400 });
+  }
+
+  const installationId = await getUserInstallationId(session.user.id);
+
+  if (!installationId) {
+    return NextResponse.json({ error: "GitHub App not connected" }, { status: 400 });
+  }
+
+  await triggerRepoSync(installationId, repoFullName, branch);
+
+  return NextResponse.json({ queued: true }, { status: 202 });
+}

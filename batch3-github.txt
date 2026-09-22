@@ -1,0 +1,643 @@
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\github\actions\index.ts ====================
+"use server";
+
+import { getServerSession } from "@/features/auth/actions";
+import { redirect } from "next/navigation";
+import { deleteInstallation } from "../server/installation";
+import { DASHBOARD_ROUTES } from "@/features/dashboard/lib/routes";
+
+
+
+export async function disconnectGithubApp() {
+    const session = await getServerSession();
+  
+    if (!session) {
+      redirect("/sign-in");
+    }
+  
+    await deleteInstallation(session.user.id);
+    redirect(DASHBOARD_ROUTES.github);
+  }
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\github\components\github-connect-card.tsx ====================
+"use client";
+
+import {
+    ArrowSquareOut,
+    GithubLogo,
+    Plugs,
+} from "@phosphor-icons/react";
+
+import type { GithubInstallationStatus } from "@/features/dashboard/lib/types";
+import {
+    statusBadge,
+    statusButtonClass,
+} from "@/features/dashboard/lib/status-style";
+import { getGithubInstallUrl } from "@/features/github/utils/github-app";
+
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import {
+    Card,
+    CardContent,
+    CardDescription,
+    CardFooter,
+    CardHeader,
+    CardTitle,
+} from "@/components/ui/card";
+import { disconnectGithubApp } from "../actions";
+
+
+type GithubConnectCardProps = {
+    userId: string;
+    installation: GithubInstallationStatus;
+};
+
+
+
+function ConnectedDetails({ accountLogin }: { accountLogin: string | null }) {
+    return (
+        <p className="text-xs text-muted-foreground">
+            Installed for{" "}
+            <span className="font-medium text-green-700 dark:text-green-400">
+                @{accountLogin}
+            </span>
+            . The app can read repository metadata and post review comments on pull
+            requests.
+        </p>
+    );
+}
+
+function DisconnectedDetails() {
+    return (
+        <ul className="list-inside list-disc space-y-1 text-xs text-muted-foreground">
+            <li>Access public and private repositories you select</li>
+            <li>Receive webhooks for pull request events</li>
+            <li>Post AI-generated review comments on PRs</li>
+        </ul>
+    );
+}
+
+function ConnectedActions() {
+    return (
+        <form action={disconnectGithubApp}>
+            <Button
+                type="submit"
+                variant="outline"
+                className={statusButtonClass.danger}
+            >
+                <Plugs />
+                Disconnect GitHub App
+            </Button>
+        </form>
+    );
+}
+
+function DisconnectedActions({ installUrl }: { installUrl: string }) {
+    return (
+        <Button
+            nativeButton={false}
+            render={<a href={installUrl} />}
+            className={statusButtonClass.success}
+        >
+            <GithubLogo />
+            Install GitHub App
+            <ArrowSquareOut className="size-3 opacity-80" />
+        </Button>
+    );
+}
+
+
+
+function ConnectionDetails({
+    connected,
+    accountLogin,
+}: {
+    connected: boolean;
+    accountLogin: string | null;
+}) {
+    if (connected) {
+        return <ConnectedDetails accountLogin={accountLogin} />;
+    }
+
+    return <DisconnectedDetails />;
+}
+
+
+function ConnectionActions({
+    connected,
+    installUrl,
+}: {
+    connected: boolean;
+    installUrl: string;
+}) {
+    if (connected) {
+        return <ConnectedActions />;
+    }
+
+    return <DisconnectedActions installUrl={installUrl} />;
+}
+
+export function GithubConnectCard({
+    userId,
+    installation,
+}: GithubConnectCardProps) {
+    const { connected, accountLogin } = installation;
+    // Install URL encodes userId so the callback can associate the installation
+    const installUrl = getGithubInstallUrl(userId);
+
+    // Default to neutral styling; switch to green when connected
+    let cardBorderClass = "border-border";
+    let iconWrapperClass = "border-border bg-muted";
+    let statusTone: "success" | "neutral" = "neutral";
+    let statusLabel = "Not connected";
+
+    if (connected) {
+        cardBorderClass = "border-green-500/30";
+        iconWrapperClass =
+            "border-green-500/40 bg-green-500/10 text-green-700 dark:text-green-400";
+        statusTone = "success";
+        statusLabel = "Connected";
+    }
+
+    return (
+        <div className="flex flex-1 flex-col gap-6 p-6">
+            <Card className={cn("max-w-2xl transition-colors", cardBorderClass)}>
+                <CardHeader>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="flex items-center gap-3">
+                            <span
+                                className={cn(
+                                    "flex size-10 items-center justify-center rounded-none border",
+                                    iconWrapperClass
+                                )}
+                            >
+                                <GithubLogo className="size-5" />
+                            </span>
+                            <div>
+                                <CardTitle>GitHub App</CardTitle>
+                                <CardDescription>
+                                    Install the Chai reviewer app on your GitHub account or
+                                    organization to access public and private repositories.
+                                </CardDescription>
+                            </div>
+                        </div>
+                        <span className={statusBadge(statusTone)}>{statusLabel}</span>
+                    </div>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                    <ConnectionDetails connected={connected} accountLogin={accountLogin} />
+                </CardContent>
+                <CardFooter className="flex flex-wrap gap-2">
+                    <ConnectionActions connected={connected} installUrl={installUrl} />
+                </CardFooter>
+            </Card>
+        </div>
+    );
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\github\lib\repos-query.ts ====================
+import { DashboardRepo } from "@/features/dashboard/lib/types";
+import { infiniteQueryOptions } from "@tanstack/react-query";
+
+
+type GithubReposPage = {
+    repos: DashboardRepo[];
+    totalCount: number;
+    page: number;
+    hasMore: boolean;
+};
+
+
+export const githubRepoKeys = {
+    all: ["github", "repos"] as const,
+};
+
+const REPOS_STALE_TIME = 10 * 60 * 1000; // 10 minutes
+
+
+export const githubReposInfiniteQuery = infiniteQueryOptions({
+    queryKey: [...githubRepoKeys.all, "list"],
+    queryFn: async ({ pageParam }) => {
+        const response = await fetch(`/api/github/repos?page=${pageParam}`);
+
+        if (!response.ok) {
+            throw new Error("Failed to load repositories");
+        }
+
+        return response.json()
+    },
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => {
+        if (lastPage.hasMore) {
+            return lastPage.page + 1
+        }
+    },
+    staleTime: REPOS_STALE_TIME
+})
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\github\server\installation.ts ====================
+import { getServerSession } from "@/features/auth/actions";
+import { DASHBOARD_ROUTES } from "@/features/dashboard/lib/routes";
+import type { GithubInstallationStatus } from "@/features/dashboard/lib/types";
+import { getGithubApp } from "@/features/github/utils/github-app";
+import { prisma } from "@/lib/db";
+import { redirect } from "next/navigation";
+
+
+function getAccountLogin(
+    account: { login?: string; slug?: string } | null | undefined
+): string | null {
+    if (!account) {
+        return null;
+    }
+
+    if ("login" in account && account.login) {
+        return account.login;
+    }
+
+    if (account.slug) {
+        return account.slug;
+    }
+
+    return null;
+}
+function buildDisconnectedStatus(): GithubInstallationStatus {
+    return { connected: false, accountLogin: null, installedAt: null };
+}
+
+
+export async function getInstallationStatus(userId: string) {
+    const installation = await prisma.githubInstallation.findUnique({
+        where: {
+            userId
+        }
+    });
+
+    if (!installation) {
+        return buildDisconnectedStatus()
+    }
+
+    return {
+        connected: true,
+        accountLogin: installation.accountLogin,
+        installedAt: installation.createdAt.toISOString()
+    }
+}
+
+
+export async function saveInstallation(userId: string, installationId: number) {
+    const app = getGithubApp();
+
+    const { data } = await app.octokit.request(
+        "GET /app/installations/{installation_id}",
+        { installation_id: installationId }
+    )
+
+    const accountLogin = getAccountLogin(data.account);
+
+    await prisma.githubInstallation.upsert({
+        where: { userId },
+        create: {
+            userId,
+            installationId,
+            accountLogin,
+            accountType: data.target_type ?? null,
+        },
+        update: {
+            installationId,
+            accountLogin,
+            accountType: data.target_type ?? null,
+        }
+    })
+}
+
+
+export async function deleteInstallation(userId: string) {
+    await prisma.githubInstallation.delete({ where: { userId } });
+}
+
+export async function getUserIdByInstallationId(installationId: number) {
+    const installation = await prisma.githubInstallation.findFirst({
+        where: { installationId },
+        select: { userId: true },
+    });
+
+    if (!installation) {
+        return null;
+    }
+
+    return installation.userId;
+}
+
+export async function getUserInstallationId(userId: string) {
+    const installation = await prisma.githubInstallation.findUnique({
+        where: { userId },
+        select: { installationId: true },
+    });
+
+    if (!installation) {
+        return null;
+    }
+
+    return installation.installationId;
+}
+
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\github\server\repos.ts ====================
+
+import { getGithubApp } from "@/features/github/utils/github-app";
+
+
+export type GithubRepo = {
+    /** GitHub's numeric repo id, stored as a string for consistency with other ids. */
+    id: string;
+    /** Short repo name without owner, e.g. `my-app`. */
+    name: string;
+    /** Full name with owner, e.g. `acme/my-app`. */
+    fullName: string;
+    /** Whether the repo is public or private on GitHub. */
+    visibility: "public" | "private";
+    /** Default branch GitHub reports (usually `main` or `master`). */
+    defaultBranch: string;
+    /** ISO timestamp of last activity on the repo. */
+    updatedAt: string;
+    /** Primary language from GitHub, or null if unknown. */
+    language: string | null;
+    /** Star count from GitHub's `stargazers_count`. */
+    stars: number;
+};
+
+
+
+function getRepoVisibility(isPrivate?: boolean): GithubRepo["visibility"] {
+    if (isPrivate) {
+        return "private";
+    }
+
+    return "public";
+}
+
+/** One page of repos plus pagination metadata for infinite scroll UI. */
+export type InstallationReposPage = {
+    repos: GithubRepo[];
+    totalCount: number;
+    page: number;
+    hasMore: boolean;
+};
+
+/** Normalizes a raw GitHub API repo object into our app's `GithubRepo` shape. */
+function mapRepo(repo: {
+    id: number;
+    name: string;
+    full_name: string;
+    private?: boolean;
+    default_branch?: string;
+    updated_at?: string | null;
+    language?: string | null;
+    stargazers_count?: number | null;
+}): GithubRepo {
+    return {
+        id: String(repo.id),
+        name: repo.name,
+        fullName: repo.full_name,
+        visibility: getRepoVisibility(repo.private),
+        defaultBranch: repo.default_branch ?? "main",
+        updatedAt: repo.updated_at ?? new Date().toISOString(),
+        language: repo.language ?? null,
+        stars: repo.stargazers_count ?? 0,
+    };
+}
+
+const REPOS_PER_PAGE = 100;
+
+
+export async function getInstallationReposPage(
+    installationId: number,
+    page = 1
+): Promise<InstallationReposPage> {
+    const app = getGithubApp();
+    // `getInstallationOctokit` exchanges the App JWT for an installation access token.
+    const octokit = await app.getInstallationOctokit(installationId);
+    const { data } = await octokit.request("GET /installation/repositories", {
+        per_page: REPOS_PER_PAGE,
+        page,
+    });
+
+    const totalCount = data.total_count;
+    const repos = data.repositories.map(mapRepo);
+
+    return {
+        repos,
+        totalCount,
+        page,
+        hasMore: page * REPOS_PER_PAGE < totalCount,
+    };
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\github\server\webhook-handler.ts ====================
+import { inngest } from "@/features/inngest/client";
+import { savePullRequest } from "@/features/reviews/server/save-pull-request";
+import { getGithubApp } from "../utils/github-app";
+import { getUserIdByInstallationId } from "./installation";
+import { canUserReview } from "@/features/billing/server/usage";
+import { prisma } from "@/lib/db";
+
+
+const REVIEWABLE_ACTIONS = ["opened", "synchronize", "reopened"];
+
+export type PullRequestWebhookPayload = {
+  /** Webhook action, e.g. `opened`, `synchronize`, `reopened` */
+  action: string;
+  /** GitHub App installation that received the event */
+  installation: { id: number };
+  repository: { full_name: string };
+  pull_request: {
+    number: number;
+    title: string;
+    user: { login: string } | null;
+    head: { sha: string };
+    base: { ref: string };
+  };
+};
+
+async function isSignatureValid(payload: string, signature: string | null) {
+  if (!signature) {
+    return false;
+  }
+
+  const app = getGithubApp();
+  // Octokit wraps GitHub's webhook crypto — rejects forged payloads.
+  return app.webhooks.verify(payload, signature);
+}
+
+
+
+export async function handleGithubWebhook(request: Request) {
+  const payload = await request.text();
+  const signature = request.headers.get("x-hub-signature-256");
+  const eventName = request.headers.get("x-github-event");
+
+  const isValid = await isSignatureValid(payload, signature);
+
+  if (!isValid) {
+    return Response.json({ error: "Invalid signature" }, { status: 401 });
+  }
+
+  if (eventName !== "pull_request") {
+    return Response.json({ received: true });
+  }
+
+  const event = JSON.parse(payload) as PullRequestWebhookPayload;
+
+  console.log("event", event);
+
+  if (!REVIEWABLE_ACTIONS.includes(event.action)) {
+    return Response.json({ received: true });
+  }
+
+  const pullRequest = await savePullRequest(event);
+
+  const userId = await getUserIdByInstallationId(event.installation.id);
+
+  if(userId){
+    const allowed = await canUserReview(userId);
+    if(!allowed){
+      await prisma.pullRequest.update({
+        where:{
+          id:pullRequest.id
+        },
+        data:{
+          status:"rate_limited"
+        }
+      });
+      return Response.json({ received: true  , rateLimited:true});
+    }
+  }
+
+  await inngest.send({
+    name: "github/pr.received",
+    data: { pullRequestId: pullRequest.id },
+  });
+
+  return Response.json({ received: true });
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\features\github\utils\github-app.ts ====================
+import {App} from "octokit";
+
+let githubApp:App | null = null;
+
+
+export function getGithubApp(){
+    if(!githubApp){
+        githubApp = new App({
+            appId:process.env.GITHUB_APP_ID!,
+            privateKey: process.env.GITHUB_APP_PRIVATE_KEY!.replace(/\\n/g, "\n"),
+            webhooks:{
+                secret:process.env.GITHUB_WEBHOOK_SECRET!
+            }
+        })
+    }
+
+    return githubApp;
+}
+
+export function getGithubInstallUrl(userId: string) {
+    const url = new URL(`https://github.com/apps/chaicode-pr-reviewer-aditya-2026/installations/new`);
+    // `state` round-trips through GitHub so we can link the installation to this user.
+    url.searchParams.set("state", userId);
+    return url.toString();
+  }
+  
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\github\callback\route.ts ====================
+import { DASHBOARD_ROUTES } from "@/features/dashboard/lib/routes";
+import { saveInstallation } from "@/features/github/server/installation";
+import { getServerSession } from "@/features/auth/actions";
+import { redirect } from "next/navigation";
+
+
+function buildSignInCallbackUrl(installationId: string | null): string {
+    if (installationId) {
+      return `/api/github/callback?installation_id=${installationId}`;
+    }
+  
+    return DASHBOARD_ROUTES.github;
+  }
+
+export async function GET(request: Request) {
+
+    const {searchParams} = new URL(request.url);
+
+    const  installationId = searchParams.get("installation_id");
+    const session = await getServerSession();
+
+
+    if(!session){
+        const callbackUrl = buildSignInCallbackUrl(installationId);
+        redirect(`/sign-in?callbackUrl=${encodeURIComponent(callbackUrl)}`); 
+    }
+
+    if(installationId){
+        await saveInstallation(session.user.id , Number(installationId))
+    }
+
+    redirect(DASHBOARD_ROUTES.github)
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\github\repos\route.ts ====================
+import { getServerSession } from "@/features/auth/actions";
+import { getUserInstallationId } from "@/features/github/server/installation";
+import { getInstallationReposPage } from "@/features/github/server/repos";
+import { getRepoSyncStatuses } from "@/features/repo-sync/server/repo-sync";
+import { dataTagErrorSymbol } from "@tanstack/react-query";
+import { NextResponse } from "next/server";
+
+export async function GET(request: Request) {
+    const session = await getServerSession();
+
+    if (!session) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const installationId = await getUserInstallationId(session.user.id);
+
+    if (!installationId) {
+        return NextResponse.json({ error: "GitHub App not connected" }, { status: 400 });
+    }
+
+    const { searchParams } = new URL(request.url);
+
+    const page = Math.max(1, Number(searchParams.get("page") ?? "1"));
+
+    const data = await getInstallationReposPage(installationId, page);
+
+    const repoFullNames = data.repos.map((repo) => repo.fullName);
+
+    const syncStatuses = await getRepoSyncStatuses(repoFullNames);
+
+    const repos = data.repos.map((repo) => ({
+        ...repo,
+        syncStatus: syncStatuses[repo.fullName] ?? null
+    }));
+
+
+    return NextResponse.json({ ...data, repos })
+}
+
+
+==================== C:\Users\aadit\OneDrive\Desktop\AI_REVIEW\chaicode-pr-reviewer\app\api\github\webhook\route.ts ====================
+import { handleGithubWebhook } from "@/features/github/server/webhook-handler";
+
+export const POST = handleGithubWebhook
+
+
